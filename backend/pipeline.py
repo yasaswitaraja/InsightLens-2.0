@@ -412,13 +412,31 @@ class InsightEngine:
 
     def _generate_insights(self):
         """Generate a structured analysis and retry once if JSON is invalid."""
-        evidence_docs = self.chunks[:12]
-        evidence = self._evidence_text(evidence_docs)[:8500]
+        # Select representative chunks across the complete document.
+        total_chunks = len(self.chunks)
+        sample_size = min(12, total_chunks)
+
+        if sample_size == 1:
+            selected_indexes = [0]
+        elif sample_size > 1:
+            selected_indexes = [
+        round(index * (total_chunks - 1) / (sample_size - 1))
+        for index in range(sample_size)
+    ]
+        else:
+            selected_indexes = []
+
+        evidence_docs = [self.chunks[index] for index in selected_indexes]
+
+    # Keep evidence IDs aligned with the actual evidence sent to the model.
+        evidence = self._evidence_text(evidence_docs)
+        while evidence_docs and len(evidence) > 8500:
+            evidence_docs = evidence_docs[:-1]
+            evidence = self._evidence_text(evidence_docs)
 
         if not evidence.strip():
-            raise RuntimeError(
-                "No readable evidence is available for analysis."
-            )
+            raise RuntimeError("No readable evidence is available for analysis."
+    )
 
         schema = """{
   "summary": "Two to four concise paragraphs.",
@@ -446,17 +464,24 @@ Return exactly one valid JSON object matching this schema:
 {schema}
 
 Requirements:
+
+Requirements:
 - Return JSON only. No Markdown fences or commentary.
 - Use double quotes for all keys and string values.
 - Escape special characters correctly.
 - Do not use trailing commas.
 - Each category must be an array.
 - Every evidence ID must match an ID in the supplied evidence.
+- Each evidence excerpt must directly support the specific claim it is attached to.
+- Do not cite an excerpt merely because it discusses the same general topic.
+- If no supplied excerpt directly supports a claim, omit that claim.
+- Use only evidence IDs that identify the relevant supporting passage.
 - Confidence must be a number between 0 and 1.
 - Keep key points, findings, and concepts concise.
 - If evidence is insufficient, use an empty array.
 - Do not invent statistics, trends, or conclusions.
 - Do not describe charts unless the evidence supports them.
+
 
 EVIDENCE:
 {evidence}
@@ -545,14 +570,28 @@ EVIDENCE:
         for item in (
             self.key_points + self.findings + self.concepts
         ):
-            item["evidence"] = [
-                evidence_id
-                for evidence_id in item.get("evidence", [])
-                if evidence_id in valid_ids
-            ]
-            item["evidence_details"] = self._evidence_lookup(
-                item["evidence"]
-            )
+            claim = item.get("text","")
+            supporting_docs = self._find_supporting_evidence(claim, limit=3)
+            item["evidence"] = []
+            item["evidence_details"] = []
+            if not supporting_docs:
+                continue
+             # Create evidence IDs that map directly to these retrieved documents.
+            for index, document in enumerate(supporting_docs, start=1):
+                evidence_id = f"E{index}"
+                metadata = document.metadata
+
+                item["evidence"].append(evidence_id)
+                item["evidence_details"].append({
+                    "id": evidence_id,
+                    "source": metadata.get("source", "Unknown source"),
+                    "source_type": metadata.get("source_type"),
+                    "page": metadata.get("page"),
+                    "timestamp": metadata.get("timestamp"),
+                    "timestamp_url": metadata.get("timestamp_url"),
+                    "excerpt": document.page_content[:420].strip(),
+                })
+
     @staticmethod
     def _normalise_items(items, include_confidence=False):
         result = []
@@ -680,11 +719,34 @@ EVIDENCE:
             ),
             "automatic": True,
         }]
-
-    def _evidence_lookup(self, evidence_ids):
+    def _find_supporting_evidence(self, claim, limit = 3):
+        """Retrieve document chunks relevant to a specific claim"""
+        if not isinstance(claim, str) or not claim.strip():
+            return []
+        if self.vector_store is None:
+            return []
+        try:
+            documents = self.vector_store.similarity_search(
+                claim.strip(), k=limit,)
+        except Exception:
+            logger.exception("Failed to retrieve evidence for claim %s",
+                             claim[:150],)
+            return []
+        results = []
+        seen = set()
+        for document in documents:
+            excerpt = document.page_content.strip()
+            if not excerpt or excerpt in seen:
+                continue    
+            seen.add(excerpt)
+            results.append(document)
+        return results
+    def _evidence_lookup(self, evidence_ids, documents=None):
+        if documents is None:
+            documents = self.chunks[:30]
         lookup = {}
 
-        for index, doc in enumerate(self.chunks[:30], start=1):
+        for index, doc in enumerate(documents, start=1):
             lookup[f"E{index}"] = doc
 
         result = []
