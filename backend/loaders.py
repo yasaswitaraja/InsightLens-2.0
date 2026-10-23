@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import tempfile
@@ -61,24 +62,28 @@ def get_youtube_metadata(video_id: str):
         "channel": None,
         "thumbnail_url": None,
     }
-
+    headers = {"User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130 Safari/537.36"
+    )
+    }
     try:
         response = requests.get(
             "https://www.youtube.com/oembed",
             params={"url": watch_url, "format": "json"},
             timeout=6,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=headers,
         )
         response.raise_for_status()
         data = response.json()
-        metadata.update({
-            "title": data.get("title"),
-            "channel": data.get("author_name"),
-            "thumbnail_url": data.get("thumbnail_url"),
-        })
-    except (requests.RequestException, ValueError, TypeError):
+        metadata["title"] = data.get("title")
+        metadata["channel"] = data.get("author_name")
+        metadata["thumbnail_url"] = data.get("thumbnail_url")
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logging.warning("YouTube oEmbed metadata retrieval failed: %s", exc)
         # Metadata is helpful for the UI, but must not block transcript work.
-        pass
+        
 
     if not metadata["title"]:
         try:
@@ -89,9 +94,10 @@ def get_youtube_metadata(video_id: str):
                 "no_warnings": True,
                 "skip_download": True,
                 "noplaylist": True,
-                "socket_timeout": 8,
-                "retries": 1,
-                "extractor_retries": 1,
+                "socket_timeout": 15,
+                "retries": 2,
+                "extractor_retries": 2,
+                "http_headers": headers,
             }
             with yt_dlp.YoutubeDL(options) as downloader:
                 info = downloader.extract_info(watch_url, download=False)
@@ -106,15 +112,14 @@ def get_youtube_metadata(video_id: str):
                 metadata["thumbnail_url"] = (
                     info.get("thumbnail") or metadata["thumbnail_url"]
                 )
-        except Exception:
+        except Exception as exc:
             # Some videos restrict metadata access; keep the app usable.
-            pass
+            logging.warning("YouTube transcript metadata retrieval failed: %s", exc)
 
-    metadata["title"] = (
-        str(metadata["title"]).strip()
-        if metadata.get("title")
-        else f"YouTube video {video_id}"
-    )
+    if metadata.get("title"):
+        metadata["title"] = str(metadata["title"]).strip()
+    else:
+        metadata["title"] = f"YouTube Video ({video_id})"
     if metadata.get("channel"):
         metadata["channel"] = str(metadata["channel"]).strip()
 

@@ -1,4 +1,3 @@
-
 import io
 import os
 import uuid
@@ -6,16 +5,16 @@ import traceback
 from typing import Callable, TypeVar
 
 from dotenv import load_dotenv
+from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from .pipeline import InsightEngine
+from .loaders import extract_video_id
 
-from pipeline import InsightEngine
-from loaders import extract_video_id
 
-
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 # ============================================================
@@ -72,10 +71,14 @@ T = TypeVar("T")
 class AskRequest(BaseModel):
     session_id: str = Field(min_length=10)
     question: str = Field(min_length=1, max_length=4000)
+    language: str = Field(default="English", max_length=40)
 
 
 class SessionRequest(BaseModel):
     session_id: str = Field(min_length=10)
+
+class LanguageRequest(SessionRequest):
+    language: str = Field(default="English", max_length=40)
 
 
 class AddUrlsRequest(SessionRequest):
@@ -370,6 +373,7 @@ async def analyze_transcript(file: UploadFile = File(...)):
 @app.post("/api/add/url")
 def add_url(request: AddUrlsRequest):
     engine = get_engine(request.session_id)
+    
 
     result = engine.result()
 
@@ -462,14 +466,77 @@ def compare(request: SessionRequest):
 # ASK A QUESTION ABOUT THE ANALYZED SOURCE
 # ============================================================
 
+
 @app.post("/api/ask")
 def ask(request: AskRequest):
     engine = get_engine(request.session_id)
+    print(
+    f"[ASK DEBUG] session_id={request.session_id}, "
+    f"sources={[source.get('title') for source in engine.sources]}",
+    f"chunk_count={len(engine.chunks)}",
+    flush=True,
+)
+
+    allowed_languages = {
+        "English",
+        "Telugu",
+        "Hindi",
+        "Tamil",
+        "Kannada",
+        "Malayalam",
+        "Spanish",
+        "French",
+        "German",
+    }
+
+    language = request.language.strip()
+
+    if language not in allowed_languages:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select a supported language.",
+        )
 
     return run_analysis(
-        lambda: engine.ask(request.question.strip())
+        lambda: engine.ask(
+            request.question.strip(),
+            language=language,
+        )
     )
 
+
+# ============================================================
+# TRANSLATE DISPLAYED ANALYSIS
+# ============================================================
+
+@app.post("/api/translate")
+def translate(request: LanguageRequest):
+    engine = get_engine(request.session_id)
+
+    allowed_languages = {
+        "English",
+        "Telugu",
+        "Hindi",
+        "Tamil",
+        "Kannada",
+        "Malayalam",
+        "Spanish",
+        "French",
+        "German",
+    }
+
+    language = request.language.strip()
+
+    if language not in allowed_languages:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select a supported language.",
+        )
+
+    return run_analysis(
+        lambda: engine.translate_result(language)
+    )
+   
 
 # ============================================================
 # EXPORT ANALYSIS AS A PDF REPORT

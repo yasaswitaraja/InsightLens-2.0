@@ -6,6 +6,8 @@ import unicodedata
 import logging
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
+
+from sqlalchemy import text
 logger = logging.getLogger(__name__)
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -27,8 +29,8 @@ from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from loaders import extract_video_id
-from loaders import (
+from .loaders import extract_video_id
+from .loaders import (
     extract_video_id,
     get_youtube_transcript,
     load_pdf_documents,
@@ -279,7 +281,7 @@ class InsightEngine:
 
             return self._add_documents(
                 documents,
-                f"YouTube video {video_id}",
+                documents[0].metadata.get("title", f"YouTube Video ({video_id})"),
                 "youtube",
                 youtube_watch_url(video_id),
                 video_id,
@@ -785,8 +787,75 @@ EVIDENCE:
             "charts": self.charts,
             "chunk_count": len(self.chunks),
         }
+    
+    
+    def translate_result(self, language: str = "English"):
+        """Translate insight text while preserving original evidence metadata."""
 
-    def ask(self, question: str):
+        allowed_languages = {
+            "English", "Telugu", "Hindi", "Tamil", "Kannada",
+            "Malayalam", "Spanish", "French", "German",
+        }
+
+        language = language.strip()
+
+        if language not in allowed_languages:
+            raise RuntimeError("Please select a supported language.")
+
+        original = {
+            "summary": self.summary,
+            "key_points": self.key_points,
+            "findings": self.findings,
+            "concepts": self.concepts,
+        }
+
+        if language == "English":
+            return original
+
+        def translate_text(text):
+            if not isinstance(text, str) or not text.strip():
+                return text
+
+            prompt = f"""
+Translate the following research insight into {language}.
+
+Rules:
+- Translate the meaning accurately and naturally.
+  - Do not add explanations or new facts.
+- Keep technical terms and proper nouns recognizable.
+- Return only the translated text, without quotes or Markdown.
+
+Text:
+{text}
+"""
+            response = self.llm.invoke(prompt)
+            translated_text = self._response_text(response).strip()
+
+            if not translated_text:
+                raise RuntimeError(
+                    "Translation returned empty text. Please retry."
+                )
+
+            return translated_text
+
+        result = {"summary": translate_text(original["summary"])}
+
+        for field in ("key_points", "findings", "concepts"):
+            translated_items = []
+
+            for original_item in original[field]:
+                safe_item = dict(original_item)
+                safe_item["text"] = translate_text(
+                    original_item.get("text", "")
+                )
+                translated_items.append(safe_item)
+
+            result[field] = translated_items
+
+        return result
+
+
+    def ask(self, question: str, language: str = "English"):
         if not self.vector_store:
             raise RuntimeError("No source is loaded.")
 
@@ -795,41 +864,95 @@ EVIDENCE:
         if not cleaned_question:
             raise RuntimeError("Please enter a question.")
 
-        docs = self.vector_store.similarity_search(
-            cleaned_question,
-            k=5,
-        )
+        allowed_languages = {
+        "English", "Telugu", "Hindi", "Tamil", "Kannada",
+        "Malayalam", "Spanish", "French", "German",
+    }
 
-        if not docs:
+        if language not in allowed_languages:
+            raise RuntimeError("Please select a supported language.")
+
+    # Retrieve more candidates so useful evidence is less likely to be missed.
+        retrieved_docs = self.vector_store.similarity_search(
+            cleaned_question,
+            k=8,
+        )
+        print("\n[QA RETRIEVAL DEBUG]", flush=True)
+        print(f"Question: {cleaned_question}", flush=True)
+        print(f"Source records: {self.sources}", flush=True)
+
+        for index, doc in enumerate(retrieved_docs, start=1):
+            print(
+        f"Chunk {index}: "
+        f"source={doc.metadata.get('source')}, "
+        f"source_index={doc.metadata.get('source_index')}, "
+        f"video_id={doc.metadata.get('video_id')}, "
+        f"text={doc.page_content[:180]!r}",
+        flush=True,
+    )
+
+        if not retrieved_docs:
             raise RuntimeError(
                 "No relevant source content was retrieved."
             )
 
+    # Remove exact duplicate chunks while keeping retrieval order.
+        docs = []
+        seen_content = set()
+
+        for doc in retrieved_docs:
+            normalized_content = " ".join(doc.page_content.split())
+
+            if not normalized_content or normalized_content in seen_content:
+                continue
+
+            seen_content.add(normalized_content)
+            docs.append(doc)
+
+            if len(docs) == 6:
+                break
+
+        if not docs:
+            raise RuntimeError(
+            "No readable source content was retrieved."
+        )
+
         context = self._evidence_text(docs)
 
         prompt = f"""
-You are a grounded research assistant.
+You are a careful research assistant.
 
-Answer using ONLY the evidence below.
+Answer the user's question using ONLY the supplied evidence.
+Write your complete answer in {language}.
 
-Cite supporting evidence inline using [E1], [E2], etc.
-Only use evidence IDs present in this context.
-If the answer is unsupported, say the information is not
-available in the analyzed sources.
+Rules:
+1. Do not invent facts or use outside knowledge.
+2. Cite supporting statements using [E1], [E2], etc.
+3. Use only evidence IDs that appear in the supplied context.
+4. Keep evidence IDs exactly as written, even when answering
+   in another language.
+5. If the evidence does not answer the question, clearly say
+   in {language} that the information is not available in
+   the analyzed sources.
+6. Distinguish explicit facts from reasonable interpretations.
+7. Be clear and concise. Do not claim that a source proves
+   something it does not actually support.
 
 EVIDENCE:
 {context}
 
 QUESTION:
 {cleaned_question}
+
+Answer in {language}:
 """
 
         answer = self.llm.invoke(prompt).content.strip()
-        print("\n ---Q&A DEBUG--- \n")
-        print("Question:", cleaned_question)
-        print("Retrieved chunk IDs:", [doc.metadata.get("chunk_id") for doc in docs])
-        print("Context sent to Groq:\n", context)
-        print("\n--- END CONTEXT ---")
+
+        if not answer:
+            raise RuntimeError("The model returned an empty answer.")
+
+    # Keep only references that correspond to retrieved documents.
         evidence = []
 
         for index, doc in enumerate(docs, start=1):
@@ -841,27 +964,24 @@ QUESTION:
             metadata = doc.metadata
 
             evidence.append({
-                "id": evidence_id,
-                "source": metadata.get(
-                    "source",
-                    "Unknown source",
-                ),
-                "page": metadata.get("page"),
-                "timestamp": metadata.get("timestamp"),
-                "timestamp_url": metadata.get("timestamp_url"),
-                "excerpt": doc.page_content[:420].strip(),
-            })
+            "id": evidence_id,
+            "source": metadata.get("source", "Unknown source"),
+            "page": metadata.get("page"),
+            "timestamp": metadata.get("timestamp"),
+            "timestamp_url": metadata.get("timestamp_url"),
+            "excerpt": doc.page_content[:420].strip(),
+        })
 
         history_item = {
-            "question": cleaned_question,
-            "answer": answer,
-            "evidence": evidence,
-        }
+        "question": cleaned_question,
+        "answer": answer,
+        "evidence": evidence,
+    }
 
         self.qa_history.append(history_item)
 
         return history_item
-
+ 
     def compare(self):
         if len(self.sources) < 2:
             raise RuntimeError(

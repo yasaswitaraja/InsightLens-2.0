@@ -60,6 +60,48 @@ function App() {
   const [result, setResult] = useState(emptyResult);
   const [sessionId, setSessionId] = useState("");
   const [question, setQuestion] = useState("");
+  const [language, setLanguage] = useState("English");
+  const [translating, setTranslating] = useState(false);
+  
+async function changeLanguage(nextLanguage) {
+  if (!sessionId || !result.summary) {
+    setLanguage(nextLanguage);
+    return;
+  }
+
+  const previousLanguage = language;
+
+  setTranslating(true);
+  setError("");
+
+  try {
+    const response = await apiFetch("/api/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        language: nextLanguage,
+      }),
+    });
+
+    const data = await parseResponse(response);
+
+    setResult((current) => ({
+      ...current,
+      summary: data.summary,
+      key_points: data.key_points,
+      findings: data.findings,
+      concepts: data.concepts,
+    }));
+
+    setLanguage(nextLanguage);
+  } catch (err) {
+    setLanguage(previousLanguage);
+    setError(`Translation failed: ${err.message}`);
+  } finally {
+    setTranslating(false);
+  }
+}
   const [messages, setMessages] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -225,7 +267,7 @@ function applyResult(data) {
       const response = await apiFetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, question: trimmed }),
+        body: JSON.stringify({ session_id: sessionId, question: trimmed, language: language}),
       });
       const data = await parseResponse(response);
       setMessages((current) => [...current, { role: "assistant", content: data.answer, evidence: data.evidence || [] }]);
@@ -299,7 +341,6 @@ function applyResult(data) {
     setComparison(null);
     setCompareUrls("");
   }
-
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -359,7 +400,34 @@ function applyResult(data) {
                 </section>
 
                 <section className="insights-column">
-                  <div className="insights-heading"><div><div className="eyebrow">SOURCE INSIGHTS</div><h2>Research overview</h2></div></div>
+                  
+<div className="insights-heading">
+  <div>
+    <div className="eyebrow">SOURCE INSIGHTS</div>
+    <h2>Research overview</h2>
+  </div>
+
+  <label className="language-control">
+    <span>Output language</span>
+    <select
+      className="language-select"
+      value={language}
+      onChange={(event) => changeLanguage(event.target.value)}
+      disabled={translating || busy}
+    >
+      <option value="English">English</option>
+      <option value="Telugu">తెలుగు (Telugu)</option>
+      <option value="Hindi">हिन्दी (Hindi)</option>
+      <option value="Tamil">தமிழ் (Tamil)</option>
+      <option value="Kannada">ಕನ್ನಡ (Kannada)</option>
+      <option value="Malayalam">മലയാളം (Malayalam)</option>
+      <option value="Spanish">Spanish</option>
+      <option value="French">French</option>
+      <option value="German">German</option>
+    </select>
+  </label>
+</div>
+
                   <InsightCard title="Executive summary" text={result.summary} />
                   <EvidenceListCard title="Key points" items={result.key_points} />
                   <EvidenceListCard title="Main findings" items={result.findings} confidence />

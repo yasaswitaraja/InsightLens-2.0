@@ -3,8 +3,8 @@
   color: #e8e8e8;
   background: #080808;
   font-synthesis: none;
-  --orange: #e5711e;
-  --orange-hover: #e5711e;
+  --orange: #ef6700;
+  --orange-hover: #e66f1b;
   --panel: #101010;
   --panel-2: #131313;
   --border: #272727;
@@ -310,4 +310,85 @@ a { color: inherit; }
 
 .youtube-open-link:hover {
   color: #ff7048;
+}
+
+/* Output language — aligned black theme */
+.output-language,
+.language-selector,
+.language-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  width: 100%;
+  box-sizing: border-box;
+  background: #000000;
+  color: #ffffff;
+  padding: 12px 20px;
+}
+
+/* Language label */
+.output-language label,
+.language-selector label,
+.language-control label {
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  margin: 0;
+}
+
+/* Dropdown */
+.output-language select,
+.language-selector select,
+.language-control select {
+  width: 200px;
+  max-width: 100%;
+  min-height: 38px;
+  box-sizing: border-box;
+  padding: 8px 32px 8px 12px;
+  border: 1px solid #444444;
+  border-radius: 6px;
+  background-color: #111111;
+  color: #ffffff;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  cursor: pointer;
+  outline: none;
+}
+
+/* Dropdown options */
+.output-language select option,
+.language-selector select option,
+.language-control select option {
+  background: #111111;
+  color: #ffffff;
+}
+
+/* Focus state */
+.output-language select:focus-visible,
+.language-selector select:focus-visible,
+.language-control select:focus-visible {
+  border-color: #ffffff;
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 15%);
+}
+
+/* Small screens */
+@media (max-width: 600px) {
+  .output-language,
+  .language-selector,
+  .language-control {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .output-language select,
+  .language-selector select,
+  .language-control select {
+    width: 100%;
+  }
 }
