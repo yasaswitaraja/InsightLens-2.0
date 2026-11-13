@@ -127,12 +127,22 @@ def get_youtube_metadata(video_id: str):
 
 
 def get_free_api_transcript(url: str):
-    """Retrieve timestamped captions from FreeTranscriptAPI."""
+    """Retrieve YouTube transcripts using the free API."""
+
+    headers = {}
+
+    api_key = os.getenv("FREETRANSCRIPT_API_KEY")
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
     response = requests.get(
         "https://api.freetranscriptapi.com/v1/transcript",
         params={"video_url": url},
+        headers=headers,
         timeout=45,
     )
+
     response.raise_for_status()
 
     data = response.json()
@@ -140,7 +150,7 @@ def get_free_api_transcript(url: str):
 
     if not isinstance(segments, list) or not segments:
         raise RuntimeError(
-            "FreeTranscriptAPI returned no transcript segments."
+            "No transcript available from the free transcript service."
         )
 
     transcript_items = []
@@ -150,6 +160,7 @@ def get_free_api_transcript(url: str):
             continue
 
         text = str(segment.get("text", "")).strip()
+
         if not text:
             continue
 

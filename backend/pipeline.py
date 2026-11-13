@@ -4,6 +4,7 @@ import os
 import re
 import unicodedata
 import logging
+import uuid
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
 
@@ -127,18 +128,23 @@ class InsightEngine:
     def _rebuild_vector_store(self):
         if not self.chunks:
             raise RuntimeError("No readable content is available.")
-
+        collection_name = f"insightlens-{uuid.uuid4().hex}"
         # Rebuild using the complete chunk list so newly added sources
         # are included in retrieval.
         self.vector_store = Chroma.from_documents(
             documents=self.chunks,
             embedding=self.embeddings,
+            collection_name=collection_name,
         )
+        print(f"[VECTOR STORE] Created isolated collection: {collection_name}", flush=True)
+        print(f"[VECTOR STORE] Indexed chunks: {len(self.chunks)}",flush=True)
+
 
     def _chunk_documents(
         self,
         documents: list[Document],
         source_index: int,
+        source_name: str,
     ):
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1200,
@@ -153,6 +159,7 @@ class InsightEngine:
 
             metadata["chunk_id"] = f"S{source_index}-C{index}"
             metadata["source_index"] = source_index
+            metadata["source_name"] = source_name
             metadata.setdefault("source_type", "unknown")
 
             output.append(
@@ -210,7 +217,7 @@ class InsightEngine:
             )
 
         source_index = len(self.sources) + 1
-        chunks = self._chunk_documents(documents, source_index)
+        chunks = self._chunk_documents(documents, source_index, source_name)
 
         if not chunks:
             raise RuntimeError(
@@ -877,11 +884,27 @@ Text:
             cleaned_question,
             k=8,
         )
+        # Allow only sources belonging to the current engine.
+        valid_source_indices = set(
+        range(1, len(self.sources) + 1))
+
+        retrieved_docs = [
+            doc
+            for doc in retrieved_docs
+            if doc.metadata.get("source_index") in valid_source_indices
+        ]
         print("\n[QA RETRIEVAL DEBUG]", flush=True)
         print(f"Question: {cleaned_question}", flush=True)
         print(f"Source records: {self.sources}", flush=True)
-
+        valid_source_names = {
+        str(source.get("name", "")).strip().lower()
+        for source in self.sources
+         if source.get("name")
+        }
+        docs_from_valid_sources = []
         for index, doc in enumerate(retrieved_docs, start=1):
+            metadata = doc.metadata
+            retrieved_source = str(metadata.get("source_name") or metadata.get("source") or "").strip().lower()
             print(
         f"Chunk {index}: "
         f"source={doc.metadata.get('source')}, "
@@ -890,7 +913,15 @@ Text:
         f"text={doc.page_content[:180]!r}",
         flush=True,
     )
-
+        if retrieved_source in valid_source_names:
+            docs_from_valid_sources.append(doc)
+        else:
+            print(
+                f"[QA WARNING] Rejected document form"
+                f"unexpected source: {retrieved_source}",
+                flush=True,
+            )
+        retrieved_docs = docs_from_valid_sources
         if not retrieved_docs:
             raise RuntimeError(
                 "No relevant source content was retrieved."
