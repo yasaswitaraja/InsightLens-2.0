@@ -1,4 +1,4 @@
-import io
+﻿import io
 import json
 import os
 import re
@@ -11,7 +11,7 @@ from xml.sax.saxutils import escape
 from sqlalchemy import text
 logger = logging.getLogger(__name__)
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
@@ -30,13 +30,13 @@ from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from .loaders import extract_video_id
 from .loaders import (
     extract_video_id,
     get_youtube_transcript,
     load_pdf_documents,
     load_url_documents,
     load_transcript_documents,
+    load_file_documents,
     youtube_watch_url,
 )
 
@@ -125,19 +125,45 @@ class InsightEngine:
 
         return text
 
-    def _rebuild_vector_store(self):
-        if not self.chunks:
-            raise RuntimeError("No readable content is available.")
-        collection_name = f"insightlens-{uuid.uuid4().hex}"
-        # Rebuild using the complete chunk list so newly added sources
-        # are included in retrieval.
-        self.vector_store = Chroma.from_documents(
-            documents=self.chunks,
-            embedding=self.embeddings,
-            collection_name=collection_name,
+
+    def _rebuild_vector_store(self, new_chunks):
+        """Create the vector store once, then index only newly added chunks."""
+        if not new_chunks:
+            raise RuntimeError("No new searchable content is available.")
+
+        chunk_ids = [
+            str(chunk.metadata["chunk_id"])
+            for chunk in new_chunks
+        ]
+
+        if self.vector_store is None:
+            collection_name = f"insightlens-{uuid.uuid4().hex}"
+
+            self.vector_store = Chroma.from_documents(
+                documents=new_chunks,
+                embedding=self.embeddings,
+                collection_name=collection_name,
+                ids=chunk_ids,
+            )
+
+            print(
+                f"[VECTOR STORE] Created isolated collection: {collection_name}",
+                flush=True,
+            )
+        else:
+            self.vector_store.add_documents(
+                documents=new_chunks,
+                ids=chunk_ids,
+            )
+
+        print(
+            f"[VECTOR STORE] Added chunks: {len(new_chunks)}",
+            flush=True,
         )
-        print(f"[VECTOR STORE] Created isolated collection: {collection_name}", flush=True)
-        print(f"[VECTOR STORE] Indexed chunks: {len(self.chunks)}",flush=True)
+        print(
+            f"[VECTOR STORE] Total indexed chunks: {len(self.chunks)}",
+            flush=True,
+        )
 
 
     def _chunk_documents(
@@ -243,10 +269,23 @@ class InsightEngine:
         self.chunks.extend(chunks)
 
         try:
-            self._rebuild_vector_store()
+            self._rebuild_vector_store(chunks)
             self._generate_insights()
             self._generate_charts()
         except Exception:
+            if old_vector_store is not None:
+                try:
+                    old_vector_store.delete(
+                        ids=[
+                            str(chunk.metadata["chunk_id"])
+                            for chunk in chunks
+                        ]
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to roll back newly indexed chunks."
+                    )
+
             self.sources = old_sources
             self.chunks = old_chunks
             self.vector_store = old_vector_store
@@ -327,9 +366,26 @@ class InsightEngine:
     def add_url(self, url: str):
         return self.analyze_url(url)
 
-    def add_pdf(self, content: bytes, filename: str):
-        return self.analyze_pdf(content, filename)
+    def add_file(self, content: bytes, filename: str):
+        """Add a supported document, spreadsheet, presentation, or code file."""
 
+        documents = load_file_documents(content, filename)
+
+        if not documents:
+            raise RuntimeError(
+                f"No readable content was extracted from {filename}."
+        )
+
+        source_type = documents[0].metadata.get(
+        "source_type",
+        "document",
+    )
+
+        return self._add_documents(
+        documents,
+        filename,
+        source_type,
+    )
     def _evidence_text(self, documents: list[Document]) -> str:
         blocks = []
 
@@ -671,7 +727,7 @@ EVIDENCE:
         pattern = (
             r"\b((?:19|20)\d{2})\b\s*"
             r"(?::|\||-)\s*"
-            r"([$€£₹]?\s*\d+(?:[,.]\d+)?\s*[KMBkmb%]?)"
+            r"([$â‚¬Â£â‚¹]?\s*\d+(?:[,.]\d+)?\s*[KMBkmb%]?)"
         )
 
         matches = re.findall(pattern, text)
@@ -746,7 +802,7 @@ EVIDENCE:
         for document in documents:
             excerpt = document.page_content.strip()
             if not excerpt or excerpt in seen:
-                continue    
+                continue
             seen.add(excerpt)
             results.append(document)
         return results
@@ -794,8 +850,8 @@ EVIDENCE:
             "charts": self.charts,
             "chunk_count": len(self.chunks),
         }
-    
-    
+
+
     def translate_result(self, language: str = "English"):
         """Translate insight text while preserving original evidence metadata."""
 
@@ -862,9 +918,184 @@ Text:
         return result
 
 
-    def ask(self, question: str, language: str = "English"):
-        if not self.vector_store:
-            raise RuntimeError("No source is loaded.")
+    @staticmethod
+    def _should_search_web(question: str) -> bool:
+        """Search the web when a question needs current or external information."""
+        web_triggers = (
+            r"\blatest\b",
+            r"\bcurrent\b",
+            r"\btoday\b",
+            r"\brecent\b",
+            r"\bnews\b",
+            r"\bthis year\b",
+            r"\bas of \d{4}\b",
+            r"\b202[5-9]\b",
+            r"\bprice\b",
+            r"\bpricing\b",
+            r"\brelease\b",
+            r"\bversion\b",
+            r"\bofficial documentation\b",
+            r"\breferences\b",
+            r"\bsources\b",
+            r"\bsearch the web\b",
+            r"\bonline\b",
+        )
+
+        return any(
+            re.search(pattern, question, re.IGNORECASE)
+            for pattern in web_triggers
+        )
+
+    def _search_web(self, question: str) -> list:
+        """Retrieve a small set of web results. Never let search failure break learning."""
+        api_key = os.getenv("TAVILY_API_KEY", "").strip()
+
+        if not api_key:
+            logger.warning("Tavily search skipped: API key is not configured.")
+            return []
+
+        try:
+            from tavily import TavilyClient
+
+            client = TavilyClient(api_key=api_key)
+            response = client.search(
+                query=question[:500],
+                search_depth="basic",
+                max_results=4,
+                include_answer=False,
+            )
+
+            sources = []
+
+            for item in response.get("results", []):
+                title = str(item.get("title") or "Web source").strip()
+                url = str(item.get("url") or "").strip()
+                content = str(item.get("content") or "").strip()
+
+                if not url.startswith(("https://", "http://")) or not content:
+                    continue
+
+                sources.append({
+                    "title": title[:250],
+                    "url": url,
+                    "content": content[:1500],
+                })
+
+            return sources
+
+        except Exception:
+            logger.exception("Tavily web search failed; continuing without web results.")
+            return []
+
+    def generate_study_tool(self, tool: str, language: str = "English"):
+        """Generate source-grounded study material from indexed chunks."""
+        if tool not in {"notes", "flashcards", "diagram"}:
+            raise RuntimeError("Unsupported study tool.")
+        if not self.chunks:
+            raise RuntimeError("Analyze a source before generating study materials.")
+
+        total = len(self.chunks)
+        count = min(12, total)
+        indexes = [
+            round(i * (total - 1) / max(count - 1, 1))
+            for i in range(count)
+        ]
+        docs = [self.chunks[i] for i in indexes]
+        context = self._evidence_text(docs)
+
+        instructions = {
+            "notes": (
+                'Return JSON: {"content":"Markdown study notes"}. '
+                "Create detailed, organized notes with headings, definitions, "
+                "relationships, supported examples and recap."
+            ),
+            "flashcards": (
+                'Return JSON: {"cards":[{"question":"...","answer":"..."}]}. '
+                "Create 12-20 informative cards across the source."
+            ),
+            "diagram": (
+                'Return JSON: {"mermaid":"...","description":"..."}. '
+                "Use Mermaid flowchart TD syntax, mapping source-supported "
+                "processes or concept relationships. No fences."
+            ),
+        }
+
+        def validate(data):
+            if not isinstance(data, dict):
+                return False
+
+            if tool == "notes":
+                return isinstance(data.get("content"), str) and bool(
+                    data["content"].strip()
+                )
+
+            if tool == "flashcards":
+                cards = data.get("cards")
+                return (
+                    isinstance(cards, list)
+                    and len(cards) > 0
+                    and all(
+                        isinstance(card, dict)
+                        and isinstance(card.get("question"), str)
+                        and bool(card["question"].strip())
+                        and isinstance(card.get("answer"), str)
+                        and bool(card["answer"].strip())
+                        for card in cards
+                    )
+                )
+
+            if tool == "diagram":
+                return (
+                    isinstance(data.get("mermaid"), str)
+                    and bool(data["mermaid"].strip())
+                )
+
+            return False
+
+        prompt = f"""Generate study material grounded strictly in the evidence.
+Write in {language}. Do not invent details.
+{instructions[tool]}
+Evidence:
+{context}
+Return valid JSON only."""
+
+        for attempt in range(2):
+            current_prompt = prompt
+
+            if attempt == 1:
+                current_prompt += (
+                    "\nYour previous response was not valid for the requested "
+                    "format. Correct it and return a complete valid JSON object "
+                    "with the required fields. Do not use Markdown fences."
+                )
+
+            try:
+                response = self.llm.invoke(current_prompt)
+                response_text = self._response_text(response)
+                parsed = self._parse_json(response_text)
+
+                if validate(parsed):
+                    return parsed
+
+                logger.warning(
+                    "Study material validation failed for tool=%s, attempt=%s.",
+                    tool,
+                    attempt + 1,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Study material generation failed for tool=%s, attempt=%s.",
+                    tool,
+                    attempt + 1,
+                )
+
+        raise RuntimeError(
+            "The AI could not generate valid study material. "
+            "Please try again."
+        )
+
+    def ask(self, question: str, language: str = "English", learning_mode: str | None = None, level: str = "Beginner",):
 
         cleaned_question = question.strip()
 
@@ -878,6 +1109,64 @@ Text:
 
         if language not in allowed_languages:
             raise RuntimeError("Please select a supported language.")
+        allowed_learning_modes = {
+            "explain",
+            "simplify",
+            "step_by_step",
+            "example",
+            "explain_code",
+        }
+
+        allowed_levels = {
+            "Beginner",
+            "Intermediate",
+            "Advanced",
+        }
+
+        if learning_mode is not None:
+            if learning_mode not in allowed_learning_modes:
+                raise RuntimeError("Please select a supported learning mode.")
+
+            if level not in allowed_levels:
+                raise RuntimeError("Please select a supported learning level.")
+
+        learning_instructions = {
+            "explain": (
+                "Explain the concept clearly, define important terms, "
+                "and show how the ideas connect."
+            ),
+            "simplify": (
+                "Simplify the difficult material into smaller, easy-to-understand "
+                "parts. Explain unfamiliar terminology."
+            ),
+            "step_by_step": (
+                "Teach the topic in a logical sequence. Number the steps "
+                "and explain each step clearly."
+            ),
+            "example": (
+                "Teach the concept using a practical example supported by "
+                "the supplied evidence. Do not invent source-specific facts."
+            ),
+            "explain_code": (
+                "Explain the code found in the supplied evidence, including "
+                "its purpose, important statements, logic, and output where "
+                "the evidence supports it. If no relevant code is available, "
+                "say so clearly."
+            ),
+        }
+
+        teaching_instruction = ""
+
+        if learning_mode is not None:
+            teaching_instruction = (
+                f"Teaching approach: {learning_instructions[learning_mode]}\n"
+                f"Student level: {level}.\n"
+                "Adjust vocabulary, depth, and explanations to this level. "
+                "For Beginner, assume no prior knowledge. For Intermediate, "
+                "explain the underlying logic. For Advanced, include deeper "
+                "technical details where supported by the evidence.\n"
+                "Use headings and short sections where they improve clarity."
+            )
 
     # Retrieve more candidates so useful evidence is less likely to be missed.
         retrieved_docs = self.vector_store.similarity_search(
@@ -951,11 +1240,11 @@ Text:
         context = self._evidence_text(docs)
 
         prompt = f"""
-You are a careful research assistant.
+You are a careful research assistant and  and educational tutor.
 
 Answer the user's question using ONLY the supplied evidence.
 Write your complete answer in {language}.
-
+{teaching_instruction}
 Rules:
 1. Do not invent facts or use outside knowledge.
 2. Cite supporting statements using [E1], [E2], etc.
@@ -1012,7 +1301,7 @@ Answer in {language}:
         self.qa_history.append(history_item)
 
         return history_item
- 
+
     def compare(self):
         if len(self.sources) < 2:
             raise RuntimeError(
@@ -1223,7 +1512,7 @@ EVIDENCE:
                     )
 
                 story.append(KeepTogether([
-                    paragraph("• " + cleaned),
+                    paragraph("â€¢ " + cleaned),
                     paragraph(
                         " | ".join(details),
                         "ILSmall",
@@ -1276,7 +1565,7 @@ EVIDENCE:
             source_name = safe_text(
                 source.get("name", "Unnamed source")
             )
-            source_url = safe_text(source.get("url") or "—")
+            source_url = safe_text(source.get("url") or "â€”")
 
             source_rows.append([
                 Paragraph(source_type, styles["ILTableCell"]),

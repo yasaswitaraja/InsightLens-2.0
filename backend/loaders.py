@@ -2,6 +2,8 @@ import logging
 import os
 import re
 import tempfile
+import csv
+import io
 
 import requests
 from langchain_core.documents import Document
@@ -451,3 +453,427 @@ def load_transcript_documents(content: bytes, filename: str):
         )
 
     return documents
+# ============================================================
+# ADVANCED DOCUMENT AND CODE LOADERS
+# ============================================================
+
+CODE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx",
+    ".java", ".c", ".cpp", ".h", ".hpp",
+    ".cs", ".go", ".rs", ".php", ".rb",
+    ".swift", ".kt", ".kts", ".sql",
+    ".html", ".css", ".scss", ".json",
+    ".xml", ".yaml", ".yml", ".sh",
+    ".ps1", ".ipynb",
+}
+
+
+def _create_file_document(text: str, filename: str, source_type: str, **extra_metadata):
+    """Create a LangChain Document with consistent file metadata."""
+
+    cleaned_text = text.strip()
+
+    if not cleaned_text:
+        return []
+
+    return [
+        Document(
+            page_content=cleaned_text,
+            metadata={
+                "source": filename,
+                "filename": filename,
+                "source_type": source_type,
+                "file_extension": os.path.splitext(filename)[1].lower(),
+                **extra_metadata,
+            },
+        )
+    ]
+
+
+def _decode_text_file(content: bytes, filename: str):
+    """Decode common text-file encodings safely."""
+
+    for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    raise RuntimeError(
+        f"Could not decode {filename}. Please upload a UTF-8 encoded file."
+    )
+
+
+def load_text_documents(content: bytes, filename: str):
+    """Load plain text and Markdown files."""
+
+    if not content:
+        raise RuntimeError("The uploaded text file is empty.")
+
+    text = _decode_text_file(content, filename)
+
+    return _create_file_document(
+        text,
+        filename,
+        "markdown" if filename.lower().endswith(".md") else "text",
+    )
+
+
+def load_docx_documents(content: bytes, filename: str):
+    """Extract paragraphs and tables from Word documents."""
+
+    if not content:
+        raise RuntimeError("The Word document is empty.")
+
+    from docx import Document as WordDocument
+
+    try:
+        word_file = WordDocument(io.BytesIO(content))
+
+        sections = []
+
+        for paragraph in word_file.paragraphs:
+            text = paragraph.text.strip()
+
+            if text:
+                sections.append(text)
+
+        for table_index, table in enumerate(word_file.tables, start=1):
+            sections.append(f"\nTable {table_index}:")
+
+            for row in table.rows:
+                cells = [
+                    cell.text.strip().replace("\n", " ")
+                    for cell in row.cells
+                ]
+
+                if any(cells):
+                    sections.append(" | ".join(cells))
+
+        extracted_text = "\n\n".join(sections)
+
+        documents = _create_file_document(
+            extracted_text,
+            filename,
+            "docx",
+        )
+
+        if not documents:
+            raise RuntimeError(
+                "No readable paragraphs or tables were found in this Word document."
+            )
+
+        return documents
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the Word document: {exc}"
+        ) from exc
+
+
+def load_csv_documents(content: bytes, filename: str):
+    """Convert CSV rows into readable structured text."""
+
+    if not content:
+        raise RuntimeError("The CSV file is empty.")
+
+    text = _decode_text_file(content, filename)
+
+    try:
+        reader = csv.reader(io.StringIO(text))
+
+        rows = list(reader)
+
+        if not rows:
+            raise RuntimeError("The CSV file contains no rows.")
+
+        headers = rows[0]
+        records = []
+
+        for row_number, row in enumerate(rows[1:], start=1):
+            values = []
+
+            for index, value in enumerate(row):
+                column = (
+                    headers[index].strip()
+                    if index < len(headers) and headers[index].strip()
+                    else f"Column {index + 1}"
+                )
+
+                values.append(f"{column}: {value.strip()}")
+
+            if values:
+                records.append(
+                    f"Record {row_number}:\n" + "\n".join(values)
+                )
+
+        extracted_text = (
+            "CSV DATA\n"
+            + "Columns: " + ", ".join(headers)
+            + "\n\n"
+            + "\n\n".join(records)
+        )
+
+        if not records:
+            raise RuntimeError("The CSV file contains no data records.")
+
+        return _create_file_document(
+            extracted_text,
+            filename,
+            "csv",
+            row_count=len(records),
+            columns=", ".join(headers),
+        )
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the CSV file: {exc}"
+        ) from exc
+
+
+def load_xlsx_documents(content: bytes, filename: str):
+    """Extract rows from every worksheet in an Excel workbook."""
+
+    if not content:
+        raise RuntimeError("The Excel file is empty.")
+
+    from openpyxl import load_workbook
+
+    try:
+        workbook = load_workbook(
+            io.BytesIO(content),
+            read_only=True,
+            data_only=True,
+        )
+
+        documents = []
+
+        for worksheet in workbook.worksheets:
+            sections = [
+                f"Worksheet: {worksheet.title}"
+            ]
+
+            rows = worksheet.iter_rows(values_only=True)
+
+            headers = next(rows, None)
+
+            if not headers:
+                continue
+
+            headers = [
+                str(value).strip() if value is not None else f"Column {index + 1}"
+                for index, value in enumerate(headers)
+            ]
+
+            sections.append("Columns: " + ", ".join(headers))
+
+            record_count = 0
+
+            for row_number, row in enumerate(rows, start=1):
+                values = []
+
+                for index, value in enumerate(row):
+                    if value is None:
+                        continue
+
+                    column = (
+                        headers[index]
+                        if index < len(headers)
+                        else f"Column {index + 1}"
+                    )
+
+                    values.append(f"{column}: {value}")
+
+                if values:
+                    record_count += 1
+                    sections.append(
+                        f"Record {row_number}:\n" + "\n".join(values)
+                    )
+
+            if record_count:
+                documents.extend(
+                    _create_file_document(
+                        "\n\n".join(sections),
+                        filename,
+                        "xlsx",
+                        sheet_name=worksheet.title,
+                        row_count=record_count,
+                        columns=", ".join(str(header) for header in headers),
+                    )
+                )
+
+        workbook.close()
+
+        if not documents:
+            raise RuntimeError(
+                "No readable data was found in the Excel worksheets."
+            )
+
+        return documents
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the Excel workbook: {exc}"
+        ) from exc
+
+
+def load_pptx_documents(content: bytes, filename: str):
+    """Extract slide text and tables from PowerPoint presentations."""
+
+    if not content:
+        raise RuntimeError("The PowerPoint file is empty.")
+
+    from pptx import Presentation
+
+    try:
+        presentation = Presentation(io.BytesIO(content))
+
+        documents = []
+
+        for slide_number, slide in enumerate(
+            presentation.slides,
+            start=1,
+        ):
+            sections = [
+                f"Slide {slide_number}"
+            ]
+
+            for shape in slide.shapes:
+
+                if shape.has_text_frame:
+                    text = shape.text.strip()
+
+                    if text:
+                        sections.append(text)
+
+                if shape.has_table:
+                    for row in shape.table.rows:
+                        cells = [
+                            cell.text.strip()
+                            for cell in row.cells
+                        ]
+
+                        sections.append(" | ".join(cells))
+
+            slide_text = "\n\n".join(sections)
+
+            documents.extend(
+                _create_file_document(
+                    slide_text,
+                    filename,
+                    "pptx",
+                    slide_number=slide_number,
+                )
+            )
+
+        if not documents:
+            raise RuntimeError(
+                "No readable text was found in the PowerPoint presentation."
+            )
+
+        return documents
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the PowerPoint presentation: {exc}"
+        ) from exc
+
+
+def load_code_documents(content: bytes, filename: str):
+    """Load source code and preserve filename and language metadata."""
+
+    if not content:
+        raise RuntimeError("The source-code file is empty.")
+
+    extension = os.path.splitext(filename)[1].lower()
+
+    if extension == ".ipynb":
+        import json
+
+        try:
+            notebook = json.loads(content.decode("utf-8-sig"))
+
+            code_sections = []
+
+            for cell_number, cell in enumerate(
+                notebook.get("cells", []),
+                start=1,
+            ):
+                if cell.get("cell_type") == "code":
+                    source = cell.get("source", "")
+
+                    if isinstance(source, list):
+                        source = "".join(source)
+
+                    if source.strip():
+                        code_sections.append(
+                            f"# Notebook code cell {cell_number}\n{source}"
+                        )
+
+            extracted_text = "\n\n".join(code_sections)
+
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read the Jupyter notebook: {exc}"
+            ) from exc
+
+    else:
+        extracted_text = _decode_text_file(content, filename)
+
+    language = extension.lstrip(".") or "unknown"
+
+    documents = _create_file_document(
+        extracted_text,
+        filename,
+        "source_code",
+        language=language,
+    )
+
+    if not documents:
+        raise RuntimeError(
+            "No readable source code was found in the file."
+        )
+
+    return documents
+
+
+def load_file_documents(content: bytes, filename: str):
+    """
+    Automatically select the correct loader based on file extension.
+
+    Returns a list of LangChain Documents ready for the RAG pipeline.
+    """
+
+    extension = os.path.splitext(filename)[1].lower()
+
+    if extension == ".docx":
+        return load_docx_documents(content, filename)
+
+    if extension in {".txt", ".md"}:
+        return load_text_documents(content, filename)
+
+    if extension == ".csv":
+        return load_csv_documents(content, filename)
+
+    if extension == ".xlsx":
+        return load_xlsx_documents(content, filename)
+
+    if extension == ".pptx":
+        return load_pptx_documents(content, filename)
+
+    if extension in CODE_EXTENSIONS:
+        return load_code_documents(content, filename)
+
+    raise RuntimeError(
+        f"Unsupported file format: {extension or 'unknown'}. "
+        "Please upload a supported document, spreadsheet, presentation, "
+        "text, or source-code file."
+    )
